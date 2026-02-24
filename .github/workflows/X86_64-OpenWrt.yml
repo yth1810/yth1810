@@ -76,6 +76,14 @@ jobs:
         COMMIT_HASH=$(git show -s --date=short --format="hash: %H")
         echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_ENV
 
+    - name: 额外清理磁盘空间（解决根分区100%占用）
+      run: |
+        # 补充清理更多大文件，确保根分区至少释放10G+空间
+        sudo rm -rf /opt/hostedtoolcache /usr/local/share/powershell
+        sudo apt-get remove -y nodejs npm || true
+        sudo apt-get autoremove -y && sudo apt-get clean
+        df -h / # 输出根分区空间，验证清理效果
+
     - name: Generate Variables
       run: |
         cp $CONFIG_FILE $OPENWRT_PATH/.config
@@ -87,6 +95,15 @@ jobs:
         echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
         DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+
+    - name: 禁用smartdns（解决Rust依赖缺失问题）
+      run: |
+        cd $OPENWRT_PATH
+        # 强制将smartdns配置改为禁用，无论原配置是否开启
+        sed -i '/CONFIG_PACKAGE_smartdns/d' .config
+        echo "CONFIG_PACKAGE_smartdns=n" >> .config
+        # 验证修改结果
+        grep "CONFIG_PACKAGE_smartdns" .config || echo "smartdns已完全禁用"
 
     - name: Cache Toolchain
       if: env.CACHE_TOOLCHAIN == 'true'
