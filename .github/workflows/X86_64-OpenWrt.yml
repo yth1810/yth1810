@@ -45,7 +45,8 @@ jobs:
         sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android $AGENT_TOOLSDIRECTORY
         sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
         sudo -E apt-get -y update
-        sudo -E apt-get -y install $(curl -fsSL is.gd/depends_ubuntu_2204)
+        # 安装Rust编译依赖（关键）
+        sudo -E apt-get -y install $(curl -fsSL is.gd/depends_ubuntu_2204) rustc cargo
         sudo -E systemctl daemon-reload
         sudo -E apt-get -y autoremove --purge
         sudo -E apt-get -y clean
@@ -54,9 +55,9 @@ jobs:
     - name: Combine Disks
       uses: easimon/maximize-build-space@master
       with:
-        swap-size-mb: 1024
+        swap-size-mb: 4096  # 增大交换分区，适配Rust编译高内存需求
         temp-reserve-mb: 100
-        root-reserve-mb: 1024
+        root-reserve-mb: 2048
 
     - name: Checkout
       uses: actions/checkout@main
@@ -76,13 +77,14 @@ jobs:
         COMMIT_HASH=$(git show -s --date=short --format="hash: %H")
         echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_ENV
 
-    - name: 额外清理磁盘空间（解决根分区100%占用）
+    - name: 深度清理磁盘空间（适配Rust+smartdns编译）
       run: |
-        # 补充清理更多大文件，确保根分区至少释放10G+空间
-        sudo rm -rf /opt/hostedtoolcache /usr/local/share/powershell
-        sudo apt-get remove -y nodejs npm || true
+        # 释放20G+空间，满足Rust工具链需求
+        sudo rm -rf /opt/hostedtoolcache /usr/local/share/powershell /usr/local/lib/node_modules
+        sudo apt-get remove -y nodejs npm docker* containerd* || true
         sudo apt-get autoremove -y && sudo apt-get clean
-        df -h / # 输出根分区空间，验证清理效果
+        sudo truncate -s 0 /var/log/*log
+        df -h / # 验证根分区空间，确保可用≥10G
 
     - name: Generate Variables
       run: |
@@ -96,14 +98,30 @@ jobs:
         DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
 
-    - name: 禁用smartdns（解决Rust依赖缺失问题）
+    - name: 补全Rust依赖（支持smartdns编译）
       run: |
         cd $OPENWRT_PATH
-        # 强制将smartdns配置改为禁用，无论原配置是否开启
+        # 1. 添加Rust官方feed源（适配coolsnowwolf/lede master分支）
+        echo "src-git rust https://github.com/openwrt/rust.git;main" >> feeds.conf.default
+        # 2. 更新并安装Rust依赖包
+        ./scripts/feeds update rust
+        ./scripts/feeds install -a -p rust
+        # 3. 兜底：手动克隆Rust源码（防止feed安装失败）
+        if [ ! -d "lang/rust" ]; then
+          git clone https://github.com/openwrt/rust.git lang/rust
+        fi
+        # 4. 验证关键依赖文件是否存在
+        if [ -f "lang/rust/rust-package.mk" ]; then
+          echo "✅ Rust依赖文件存在，smartdns编译条件满足"
+        else
+          echo "❌ Rust依赖文件缺失，编译可能失败"
+          exit 1
+        fi
+        # 5. 强制启用smartdns
         sed -i '/CONFIG_PACKAGE_smartdns/d' .config
-        echo "CONFIG_PACKAGE_smartdns=n" >> .config
-        # 验证修改结果
-        grep "CONFIG_PACKAGE_smartdns" .config || echo "smartdns已完全禁用"
+        echo "CONFIG_PACKAGE_smartdns=y" >> .config
+        # 验证配置
+        grep "CONFIG_PACKAGE_smartdns" .config
 
     - name: Cache Toolchain
       if: env.CACHE_TOOLCHAIN == 'true'
@@ -135,7 +153,7 @@ jobs:
       run: |
         cd $OPENWRT_PATH
         make defconfig
-        make download -j8
+        make download -j4  # 调低下载线程，避免网络超时
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
@@ -145,8 +163,9 @@ jobs:
         cd $OPENWRT_PATH
         mkdir -p files/etc/uci-defaults
         cp $GITHUB_WORKSPACE/scripts/init-settings.sh files/etc/uci-defaults/99-init-settings
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        # 调低编译线程（Rust编译耗内存，避免OOM）
+        echo -e "2 thread compile (适配Rust+smartdns编译)"
+        make -j2 || make -j1 || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
         echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
         echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
